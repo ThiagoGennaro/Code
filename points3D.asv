@@ -1,0 +1,211 @@
+% function tracks = points3D( tracks, bufferLoS, sendCamera, LTicks_c, cycle_st, cycle_end, camera, k)
+%
+% Output-:
+% tracks: resultado dos alvos com relação ao ponto no 3D no instante de
+% captura da câmera
+%
+% Input-:
+% tracks: alvos da i-ésima câmera
+% extrinsec: parâmetros extrínsecos da i-ésima câmera
+% bufferLos: Onde se localizam os alvos enviados pelas câmeras vizinhas
+% sendCamera: câmeras que enviaram dentro da janela temporal
+% LTicks_c: momentos de captura das câmeras dada pela linha de relógio
+% gerada na função ClockCamerasGenerator
+% cycle_st: início de cada um dos ciclos de janela temporal
+% cycle_end: fim de cada uma dos ciclos de janela temporal
+% câmera: câmera analisada 
+% k: k-ésimo instante
+
+% Baseado em: 
+% Sandeep Katragadda and Andrea Cavallaro, “A batch asynchronous tracker for 
+% wireless smart-camera networks”, Proceedings of the 14th IEEE International 
+% Conference on Advanced Video and Signal based Surveillance (AVSS), Lecce, 
+% Italy, 29 August - 1 September, 2017.
+%
+
+function tracks = points3D( tracks, extrinsec, intrinsec, bufferLoS, sendCamera, LTicks_c, cycle_st, cycle_end, camera, Pinv, k, debug )
+
+%% processa os pontos dentro da janela temporal:
+
+% verifica se acabou o ciclo da janela temporal
+cIdx = find(k == cycle_end);
+
+% entra no processamento somente se k é o fim do ciclo da janela temporal
+if numel(cIdx) == 1 
+    
+    cs = cycle_st(cIdx);  % começo do ciclo
+    ce = cycle_end(cIdx); % término do ciclo
+    PP = numel(tracks);   % número de alvos
+    
+    % período total referente a janela temporal
+    kcs = cs:ce;
+    
+    % momento de captura LTicks_c dentro da janela temporal 
+    kcIdx = find(LTicks_c(camera,kcs)==2);
+    k_e = kcs(kcIdx);
+    
+    % para cada um dos t alvos
+    for t = 1:PP % t: target
+        
+        % buffer de pontos para cada um dos alvos
+        cloudPoints = [];
+        
+        % buffer de estampa temporal 
+        timeStamp = [];
+         
+        % buffer de médias obtidas do mesmo alvo no espaço 3D em instantes 
+        % distintos na janela temporal
+        target = [];
+        targetMean = [];
+        
+        % todas as capturas das Linhas de Visadas do alvo p dentro da 
+        % janela temporal 
+        x = tracks(t).bufferLoS(:,kcs);
+        
+        % polinômio interpolador 2D que descreve a trajetória do alvo, no 
+        % plano da imagem, dado em coordenadas globais
+        polinomialInterpolation2d( x, camera, tracks(t).id, debug );
+        
+        % para cada instante dentro da janela temporal
+        for tw = cs:ce % tw: time on temporal window
+            
+            % teste para verificar quais são os momentos que o alvo t foi
+            % detectado dentro da janela temporal e se nesse instante há
+            % dados no buffer de recebimento
+            if ( tracks(t).targetDetected(1,tw) == 1 && ~isempty(sendCamera{tw}) )
+                
+                % acha a quantidade de câmeras que enviou no instante t
+                sz_sendCamera = size(sendCamera{tw},2);
+                
+                % para cada uma das vizinhas que enviou durante a janela
+                % temporal
+                for ns = 1:sz_sendCamera % ns:  neighboor sent
+                    
+                    % teste para verificar se a câmera não é a i-esima
+                    % câmera e sim sua j-ésima vizinha
+                    if ( sendCamera{tw}(ns) ~= camera )
+                    
+                        % acha os índices não nulos onde os alvos vizinhos
+                        % se encontram no buffer das linhas de visada
+                        [ ~, cols, ~ ] = find(bufferLoS(1,:,sendCamera{tw}(ns),tw)~=0);
+                        
+                        % quantidade de alvos recebidos pela i-ésima câmera
+                        % da sua câmera vizinha
+                        sz_cols = size(cols,2);
+                        
+                        for nt = 1:sz_cols %nt: neighboor target
+                            
+                            % leitura do alvo vizinho
+                            target_j = bufferLoS(2:7,cols(nt),sendCamera{tw}(ns),tw);
+                            
+                            % "sigma points" do alvo da i-ésima câmera e do
+                            % alvo da j-ésima câmera
+                            [ spA, spB ] = sigmaPoints( tracks(t).bufferLoS(2:7,tw), target_j, camera, sendCamera{tw}(ns), tracks(t).id, debug );
+                            
+                            % comparação dos alvos por meio de retas
+                            % reversas. A distância máxima permitida entre
+                            % os alvos é de 70cm.
+                            [ pts3D, flag ] = comparisionTargetLoS(spA,spB );
+                            
+                            % salva os pontos pertinentes ao alvo obtidos
+                            % por uma ou mais câmeras
+                            if ( strcmp(flag,'saveMeas') )
+                                
+                                % nuvem de pontos de cada um dos alvos salvas
+                                % nos buffers
+                                cloudPoints = [cloudPoints pts3D];
+                                timeStamp   = [timeStamp repmat(tw,[1 49])];
+                                target      = [timeStamp; cloudPoints];
+                                
+                                % médias calculadas dos buffers
+                                cloudPointsMean = mean(pts3D,2);
+                                timeStampMean   = tw;
+                                targetMean      = [targetMean [timeStampMean; cloudPointsMean]];
+                                
+                            end
+                            
+                        end
+  
+                    end 
+                    
+                end
+                
+            end
+            
+        end
+        
+        if(~isempty(target))
+            
+            % pontos obtidos pela fusão dos diferentes pontos obtidos por
+            % comparação das linhas de visada para cada k-ésimo instante dentro
+            % da janela temporal
+            [ tracks(t).measLoS, fusionPoints, tracks(t).meas3Dto2D ] = ...
+                fusion3DPoints( tracks(t).measLoS, tracks(t).meas3Dto2D, target, extrinsec, intrinsec, cs, ce );
+            
+            % mostra o resultado das medidas obtidas pela comparação das linhas
+            % de visadas -:
+            % target - todas as comparações
+            % targetMean - média para cada instante para cada um dos alvos
+            % comparados, ou seja, pode-se obter um ou mais pontos no espaço 3D
+            % para um mesmo k-ésimo instante
+            % fusionPoints - média obtida de todos os pontos obtidos para um
+            % mesmo k-ésimo instante dentro da janela temporal
+            showResults( extrinsec, target, targetMean, fusionPoints, camera, tracks(t).id, kcs, k_e, debug );
+            
+            % mostra os resultados obtidos no plano da imagem da câmera
+            showResults3Dto2D( tracks(t).meas3Dto2D, tracks(t).bufferCentroids, camera, tracks(t).id, kcs, k_e, k, debug );
+            
+            %verificação dos pontos obtidos dentro da janela temporal para
+            %o momento de captura-:
+            % caso haja medida no instante de captura, o alvo ja está pronto
+            % para ser estimado.
+            % caso não haja medida no instante de captura, deve-se realizar
+            % uma análise das medidas para os k-ésimos instantes dentro da janela
+            % temporal para produzir uma medida no instate de captura
+            [ tracks(t).measLoS, ...
+              tracks(t).meas3Dto2D,... 
+              tracks(t).y, ...
+              tracks(t).Y, ...
+              tracks(t).x, ...
+              tracks(t).x3Dto2D, ...
+              tracks(t).xx, ...
+              tracks(t).xx3Dto2D, ...
+              tracks(t).pf, ...
+              tracks(t).pf_x, ...
+              tracks(t).pf_xx, ...
+              tracks(t).pf_cov, ...
+              tracks(t).pf_x3Dto2D,...
+              tracks(t).pf_xx3Dto2D, ...
+              tracks(t).fz ] = ...
+                dataAnalisys3D( tracks(t).measLoS, ...
+                                tracks(t).meas3Dto2D, ...
+                                extrinsec, ...
+                                intrinsec, ...
+                                cs, ...
+                                ce, ...
+                                k_e, ...
+                                Pinv, ...
+                                tracks(t).fz, ...
+                                tracks(t).y, ...
+                                tracks(t).Y, ...
+                                tracks(t).x, ...
+                                tracks(t).x3Dto2D, ...
+                                tracks(t).xx, ...
+                                tracks(t).xx3Dto2D, ...
+                                tracks(t).pf, ...
+                                tracks(t).pf_x, ...
+                                tracks(t).pf_xx, ...
+                                tracks(t).pf_cov, ...
+                                tracks(t).pf_x3Dto2D, ...
+                                tracks(t).pf_xx3Dto2D );
+            
+            % mostra resultados com a tentativa de traçar todo percurso dentro
+            % da janela temporal
+            filtro = 0;
+            showResultsAnalisys3Dto2D( tracks(t), camera, extrinsec, kcs, k_e, k, '', filtro, debug )
+            
+        end
+        
+    end
+    
+end
